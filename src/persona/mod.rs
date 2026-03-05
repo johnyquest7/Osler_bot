@@ -69,9 +69,6 @@ impl SystemPrompt {
         if !tool_descriptions.is_empty() {
             parts.push(format!(
                 "You have access to the following tools:\n{tool_descriptions}\n\
-                 To call a tool, respond with a JSON block like:\n\
-                 ```tool_call\n{{\"tool\": \"<name>\", \"params\": {{...}}}}\n```\n\
-                 The tool result will be returned to you. \
                  Only call tools when clearly necessary. \
                  Always confirm shell commands with the user before executing if they \
                  are destructive (rm, delete, overwrite)."

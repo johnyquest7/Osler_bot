@@ -28,15 +28,20 @@ use std::sync::Arc;
 pub enum WorkerRequest {
     Chat {
         system: String,
-        history: Vec<ChatMessage>,
+        /// Pre-built provider-format messages (built by AiClient::history_to_messages)
+        messages: Vec<serde_json::Value>,
         tools: Vec<ToolDef>,
+        provider: crate::config::AiProvider,
     },
     Shutdown,
 }
 
 pub enum WorkerResponse {
     Text(String),
-    ToolCall { name: String, params: serde_json::Value },
+    /// Shown in status bar while the tool is executing
+    ToolStatus(String),
+    /// Tool finished – show result bubble in chat
+    ToolResult { name: String, output: String },
     Error(String),
 }
 
@@ -109,10 +114,14 @@ impl OslerApp {
             &self.config.ai, &self.config.user, &memory_ctx, &tool_desc,
         ).content;
 
+        let provider = self.config.ai.provider.clone();
+        let messages = crate::ai::AiClient::history_to_messages(&provider, &self.short_term.messages());
+
         let _ = self.worker_tx.send(WorkerRequest::Chat {
             system,
-            history: self.short_term.messages(),
+            messages,
             tools: self.tool_registry.definitions(),
+            provider,
         });
         self.chat_panel.status_line = "Waiting for AI…".into();
     }
@@ -126,8 +135,13 @@ impl OslerApp {
                     self.short_term.push(ChatMessage::assistant(text));
                     self.maybe_persist_memory();
                 }
-                Ok(WorkerResponse::ToolCall { name, .. }) => {
-                    self.chat_panel.status_line = format!("Running tool: {name}…");
+                Ok(WorkerResponse::ToolStatus(msg)) => {
+                    // Keep spinner, just update status line
+                    self.chat_panel.status_line = msg;
+                }
+                Ok(WorkerResponse::ToolResult { name, output }) => {
+                    // Tool done – show bubble, keep spinner (AI still thinking)
+                    self.short_term.push(ChatMessage::tool_result(&name, &output));
                 }
                 Ok(WorkerResponse::Error(err)) => {
                     self.chat_panel.waiting = false;

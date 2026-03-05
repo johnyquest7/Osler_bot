@@ -82,37 +82,58 @@ fn main() -> Result<()> {
 
             match req {
                 WorkerRequest::Shutdown => break,
-                WorkerRequest::Chat { system, history, tools } => {
+                WorkerRequest::Chat { system, mut messages, tools, provider } => {
                     // Clone secrets before the await so no guard is held across it
                     let secrets_snap = secrets_watch_rx.borrow().clone();
                     let cfg = config_for_worker.ai.clone();
 
-                    let result = ai_client
-                        .send(&cfg, &secrets_snap, &system, &history, &tools)
-                        .await;
-
-                    match result {
-                        Ok(crate::ai::AiResponse::Text(t)) => {
-                            let _ = worker_response_tx.send(WorkerResponse::Text(t));
-                        }
-                        Ok(crate::ai::AiResponse::ToolCall { name, params }) => {
-                            let _ = worker_response_tx.send(WorkerResponse::ToolCall {
-                                name: name.clone(),
-                                params: params.clone(),
-                            });
-                            match tool_registry_worker.execute(&name, params).await {
-                                Ok(s) => {
-                                    let _ = worker_response_tx.send(WorkerResponse::Text(s));
-                                }
-                                Err(e) => {
-                                    let _ = worker_response_tx
-                                        .send(WorkerResponse::Error(e.to_string()));
-                                }
-                            }
-                        }
-                        Err(e) => {
+                    // Multi-turn tool calling loop (max 8 iterations to avoid runaway)
+                    let mut iterations = 0u32;
+                    loop {
+                        iterations += 1;
+                        if iterations > 8 {
                             let _ = worker_response_tx
-                                .send(WorkerResponse::Error(e.to_string()));
+                                .send(WorkerResponse::Error("Too many tool iterations".into()));
+                            break;
+                        }
+
+                        let result = ai_client
+                            .send(&cfg, &secrets_snap, &system, &messages, &tools)
+                            .await;
+
+                        match result {
+                            Ok(crate::ai::AiResponse::Text(t)) => {
+                                let _ = worker_response_tx.send(WorkerResponse::Text(t));
+                                break;
+                            }
+                            Ok(crate::ai::AiResponse::ToolCall(call)) => {
+                                let _ = worker_response_tx.send(WorkerResponse::ToolStatus(
+                                    format!("Running tool: {}…", call.name),
+                                ));
+
+                                let tool_output = match tool_registry_worker
+                                    .execute(&call.name, call.params.clone())
+                                    .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => format!("Tool error: {e}"),
+                                };
+
+                                let _ = worker_response_tx.send(WorkerResponse::ToolResult {
+                                    name: call.name.clone(),
+                                    output: tool_output.clone(),
+                                });
+
+                                // Append assistant tool_call + result, then loop back to AI
+                                AiClient::append_tool_result(
+                                    &provider, &mut messages, &call, &tool_output,
+                                );
+                            }
+                            Err(e) => {
+                                let _ = worker_response_tx
+                                    .send(WorkerResponse::Error(e.to_string()));
+                                break;
+                            }
                         }
                     }
                 }
@@ -150,34 +171,34 @@ fn main() -> Result<()> {
                             &config_tg.ai, &config_tg.user, "", &tool_desc,
                         ).content;
 
-                        let result = ai_client
-                            .send(
-                                &config_tg.ai,
-                                &worker_secrets_tg,
-                                &system,
-                                &tg_mem.messages(),
-                                &tools_tg.definitions(),
-                            )
-                            .await;
+                        let provider = config_tg.ai.provider.clone();
+                        let mut messages = AiClient::history_to_messages(&provider, &tg_mem.messages());
+                        let tools = tools_tg.definitions();
 
-                        let reply = match result {
-                            Ok(crate::ai::AiResponse::Text(t)) => {
-                                tg_mem.push(memory::short_term::ChatMessage::assistant(t.clone()));
-                                t
-                            }
-                            Ok(crate::ai::AiResponse::ToolCall { name, params }) => {
-                                match tools_tg.execute(&name, params).await {
-                                    Ok(out) => {
-                                        tg_mem.push(
-                                            memory::short_term::ChatMessage::tool_result(&name, &out),
-                                        );
-                                        format!("Tool `{name}`:\n{out}")
-                                    }
-                                    Err(e) => format!("Tool error: {e}"),
+                        // Multi-turn tool loop for Telegram
+                        let mut reply = String::from("Error: no response");
+                        let mut iters = 0u32;
+                        loop {
+                            iters += 1;
+                            if iters > 8 { reply = "Too many tool iterations".into(); break; }
+
+                            match ai_client.send(&config_tg.ai, &worker_secrets_tg, &system, &messages, &tools).await {
+                                Ok(crate::ai::AiResponse::Text(t)) => {
+                                    tg_mem.push(memory::short_term::ChatMessage::assistant(t.clone()));
+                                    reply = t;
+                                    break;
                                 }
+                                Ok(crate::ai::AiResponse::ToolCall(call)) => {
+                                    let out = match tools_tg.execute(&call.name, call.params.clone()).await {
+                                        Ok(s) => s,
+                                        Err(e) => format!("Tool error: {e}"),
+                                    };
+                                    tg_mem.push(memory::short_term::ChatMessage::tool_result(&call.name, &out));
+                                    AiClient::append_tool_result(&provider, &mut messages, &call, &out);
+                                }
+                                Err(e) => { reply = format!("Error: {e}"); break; }
                             }
-                            Err(e) => format!("Error: {e}"),
-                        };
+                        }
 
                         let _ = tg_resp_tx
                             .send(telegram::TelegramAiResponse { chat_id: req.chat_id, text: reply })
